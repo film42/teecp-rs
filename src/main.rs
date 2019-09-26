@@ -152,46 +152,43 @@ fn main() -> Result<()> {
                 connect_futures.push(TcpStream::connect(tee_addr))
             }
 
-            let lifecycle =
-                join_all(connect_futures).and_then(|mut conns| {
-                    println!("Conns: {:?}", conns);
+            let lifecycle = join_all(connect_futures).and_then(|mut conns| {
+                println!("Conns: {:?}", conns);
 
-                    let (clt_reader, clt_writer) = client.split();
-                    let srv_stream = conns.remove(0);
-                    let (srv_reader, srv_writer) = srv_stream.split();
+                let (clt_reader, clt_writer) = client.split();
+                let srv_stream = conns.remove(0);
+                let (srv_reader, srv_writer) = srv_stream.split();
 
-                    let mut multi_writer = MultiWriter::new();
-                    multi_writer.push(Box::new(srv_writer));
+                let mut multi_writer = MultiWriter::new();
+                multi_writer.push(Box::new(srv_writer));
 
-                    let tee_reader_copy_futures: Vec<
-                        tokio::io::Copy<tokio::io::ReadHalf<TcpStream>, WriteProxy>,
-                    > = conns
-                        .drain(..)
-                        .map(|tee_conn| {
-                            let (tee_reader, tee_writer) = tee_conn.split();
-                            multi_writer.push(Box::new(tee_writer));
-                            copy(tee_reader, WriteProxy::sink())
-                        })
-                        .collect();
-
-                    proxy_copy(
-                        Box::new(clt_reader),
-                        Box::new(multi_writer),
-                        Box::new(srv_reader),
-                        Box::new(clt_writer),
-                    )
-                    .select2(tokio::prelude::future::select_all(tee_reader_copy_futures))
-                    .then(|x| {
-                        x.map(|_| println!("It completed!"))
-                            .map_err(|err| {
-                                eprintln!("An error occurred during the proxy: {:?}", err)
-                            })
-                            .expect("never errors");
-
-                        // Do this because the type system doesn't want an io::Error here?
-                        future::ok(())
+                let tee_reader_copy_futures: Vec<
+                    tokio::io::Copy<tokio::io::ReadHalf<TcpStream>, WriteProxy>,
+                > = conns
+                    .drain(..)
+                    .map(|tee_conn| {
+                        let (tee_reader, tee_writer) = tee_conn.split();
+                        multi_writer.push(Box::new(tee_writer));
+                        copy(tee_reader, WriteProxy::sink())
                     })
-                });
+                    .collect();
+
+                proxy_copy(
+                    Box::new(clt_reader),
+                    Box::new(multi_writer),
+                    Box::new(srv_reader),
+                    Box::new(clt_writer),
+                )
+                .select2(tokio::prelude::future::select_all(tee_reader_copy_futures))
+                .then(|x| {
+                    x.map(|_| println!("It completed!"))
+                        .map_err(|err| eprintln!("An error occurred during the proxy: {:?}", err))
+                        .expect("never errors");
+
+                    // Do this because the type system doesn't want an io::Error here?
+                    future::ok(())
+                })
+            });
 
             tokio::spawn(
                 lifecycle
