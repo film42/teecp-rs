@@ -44,7 +44,7 @@ where
 
 impl<T> MultiWriter<T>
 where
-    T: AsyncWrite + Write + Send + Sync + Sized,
+    T: AsyncWrite,
 {
     pub fn new() -> MultiWriter<T> {
         MultiWriter { writers: vec![] }
