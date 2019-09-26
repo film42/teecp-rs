@@ -57,7 +57,7 @@ where
 
 impl<T> Write for MultiWriter<T>
 where
-    T: AsyncWrite + Write + Send + Sync + Sized,
+    T: AsyncWrite,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         for writer in self.writers.iter_mut() {
@@ -78,7 +78,7 @@ where
 
 impl<T> AsyncWrite for MultiWriter<T>
 where
-    T: AsyncWrite + Write + Send + Sync + Sized,
+    T: AsyncWrite,
 {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         for writer in self.writers.iter_mut() {
