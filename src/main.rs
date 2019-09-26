@@ -116,10 +116,10 @@ fn proxy_copy<R1, W1, R2, W2>(
     src_writer: W2,
 ) -> tokio::prelude::future::Select2<tokio::io::Copy<R1, W1>, tokio::io::Copy<R2, W2>>
 where
-    R1: AsyncRead + Send + Sync,
-    R2: AsyncRead + Send + Sync,
-    W1: AsyncWrite + Send + Sync,
-    W2: AsyncWrite + Send + Sync,
+    R1: AsyncRead,
+    R2: AsyncRead,
+    W1: AsyncWrite,
+    W2: AsyncWrite,
 {
     let src_to_dest = copy(dest_reader, src_writer);
     let dest_to_src = copy(src_reader, dest_writer);
