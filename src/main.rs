@@ -1,10 +1,12 @@
 use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
-use futures::future::{select_all,try_select};
+use futures::future::{select_all, try_select};
+use futures::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::net::SocketAddr; // Shutdown
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
 
@@ -29,6 +31,18 @@ static EXAMPLE_CONFIG: &str = r#"
 }
 "#;
 
+async fn connect_to_tees(
+    tee_addrs: &Arc<Mutex<Vec<SocketAddr>>>,
+) -> Result<Option<Vec<TcpStream>>, Box<dyn std::error::Error>> {
+    let mut tees = vec![];
+    for tee_addr in tee_addrs.lock().await.iter() {
+        let tee_conn = TcpStream::connect(tee_addr).await?;
+        println!("Was here -- tee : {:?}", tee_conn);
+        tees.push(tee_conn);
+    }
+    Ok(Some(tees))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c: Config = serde_json::from_str(EXAMPLE_CONFIG)?;
@@ -41,42 +55,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|s| s.to_string().parse::<SocketAddr>().unwrap())
         .collect();
+
+    let tee_addrs_mu = Arc::new(Mutex::new(tee_addrs));
     //println!("Tees: {:?}", tee_addrs);
 
     let mut listener = TcpListener::bind(&bind_addr).await?;
 
     loop {
         let (mut client, _) = listener.accept().await?;
-
-        // TODO: How do we move these calls into the move block below?
-
         let mut proxy_conn = TcpStream::connect(&proxy_addr).await.unwrap();
-        //let mut connect_futures = vec![proxy_conn];
-
-        for tee_addr in tee_addrs.iter() {
-            let tee_conn = TcpStream::connect(tee_addr).await.unwrap();
-
-            println!("Was here -- tee : {:?}", tee_conn);
-        }
-
-        // TODO: through here..?
+        let tee_addrs_mu = tee_addrs_mu.clone();
 
         tokio::spawn(async move {
+            let mut multi_writer = MultiWriter::new();
+
+            let mut tee_conns = connect_to_tees(&tee_addrs_mu).await.unwrap().unwrap();
+
             println!("Attempt to proxy: {:?}, {:?}", proxy_conn, client);
 
-            let (mut clt_reader, mut clt_writer) = client.split();
+            let (mut clt_reader, clt_writer) = client.split();
+            let mut clt_multi_writer = MultiWriter::new();
+            clt_multi_writer.push(Box::new(clt_writer));
+
             //let srv_stream = conns.remove(0);
             let (mut srv_reader, srv_writer) = proxy_conn.split();
 
-            let mut multi_writer = MultiWriter::new();
             multi_writer.push(Box::new(srv_writer));
 
-            try_select(
-                clt_reader.copy(&mut multi_writer),
-                srv_reader.copy(&mut clt_writer),
-            )
-            .await
-            .unwrap();
+            let mut copy_futures = vec![];
+            copy_futures.push(clt_reader.copy(&mut multi_writer));
+            copy_futures.push(srv_reader.copy(&mut clt_multi_writer));
+
+            // for mut tee_conn in tee_conns.drain(..) {
+            //     let (mut tee_reader, tee_writer) = tee_conn.split();
+            //     multi_writer.push(Box::new(tee_writer));
+            //     let mut sink = MultiWriter::sink();
+            //     copy_futures.push(tee_reader.copy(&mut sink))
+            // }
+
+            // select_all(
+            //     tee_conns
+            //         .drain(..)
+            //         .map(|tee_conn| {
+            //             let (mut tee_reader, tee_writer) = tee_conn.split();
+            //             multi_writer.push(Box::new(tee_writer));
+            //             let mut sink = WriteProxy::sink();
+            //             tee_reader.copy(&mut sink)
+            //         })
+            //         .collect(),
+            // ),
+            let (res, _, _) = select_all(copy_futures).await;
+            res.unwrap();
 
             println!("All done");
         });
@@ -206,6 +235,10 @@ where
     T: AsyncWrite,
 {
     pub fn new() -> MultiWriter<T> {
+        MultiWriter { writers: vec![] }
+    }
+
+    pub fn sink() -> MultiWriter<T> {
         MultiWriter { writers: vec![] }
     }
 
