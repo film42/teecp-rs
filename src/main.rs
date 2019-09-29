@@ -102,14 +102,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // let mut copy_futures: Vec<_> = copy_futures1.into_iter().map(|(_,_,future)| future).collect();
 
-
             //let mut tee_conn = tee_conns.drain(..).next().unwrap();
 
-                // }
+            // }
 
             copy_futures.push(clt_reader.copy(&mut multi_writer));
             copy_futures.push(srv_reader.copy(&mut clt_multi_writer));
-
 
             // select_all(
             //     tee_conns
@@ -298,7 +296,13 @@ where
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-println!("Poll write for buf (len: {}): {:?} {:?}", self.writers.len(), cx, std::str::from_utf8(buf));
+        println!(
+            "Poll write for buf (len: {}): {:?} {:?}",
+            self.writers.len(),
+            cx,
+            std::str::from_utf8(buf)
+        );
+
         for mut writer in self.writers.iter_mut() {
             Pin::new(&mut writer).poll_write(cx, buf)?;
         }
