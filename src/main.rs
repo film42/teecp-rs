@@ -4,7 +4,7 @@ use core::task::Poll;
 use futures::future::{select_all, try_select};
 use futures::lock::Mutex;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+//use std::io::Write;
 use std::net::SocketAddr; // Shutdown
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -77,21 +77,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut clt_multi_writer = MultiWriter::new();
             clt_multi_writer.push(Box::new(clt_writer));
 
-            //let srv_stream = conns.remove(0);
             let (mut srv_reader, srv_writer) = proxy_conn.split();
-
             multi_writer.push(Box::new(srv_writer));
 
             let mut copy_futures = vec![];
-            copy_futures.push(clt_reader.copy(&mut multi_writer));
-            copy_futures.push(srv_reader.copy(&mut clt_multi_writer));
+            // let mut multi_writer = MultiWriter::new();
+            // let mut sinks = vec![];
 
-            // for mut tee_conn in tee_conns.drain(..) {
+            // for tee_conn in tee_conns.iter_mut() {
+            //     let (mut tee_reader, tee_writer) = tee_conn.split();
+            //     multi_writer.push(Box::new(tee_writer));
+
+            //     sinks.push(MultiWriter::sink());
+            //     let sink = sinks.last_mut().unwrap();
+            //     copy_futures.push(tee_reader.copy(sink));
+            // }
+
+            // let mut copy_futures: Vec<_> = tee_conns.into_iter().map(|mut tee_conn| {
             //     let (mut tee_reader, tee_writer) = tee_conn.split();
             //     multi_writer.push(Box::new(tee_writer));
             //     let mut sink = MultiWriter::sink();
-            //     copy_futures.push(tee_reader.copy(&mut sink))
-            // }
+            //     tee_reader.copy(&mut sink)
+            // }).collect();
+
+            // let mut copy_futures: Vec<_> = copy_futures1.into_iter().map(|(_,_,future)| future).collect();
+
+
+            //let mut tee_conn = tee_conns.drain(..).next().unwrap();
+
+                // }
+
+            copy_futures.push(clt_reader.copy(&mut multi_writer));
+            copy_futures.push(srv_reader.copy(&mut clt_multi_writer));
+
 
             // select_all(
             //     tee_conns
@@ -185,41 +203,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // use tokio::net::{TcpListener, TcpStream};
 // use tokio::prelude::*;
 
-#[derive(Debug)]
-struct WriteProxy;
+// #[derive(Debug)]
+// struct WriteProxy;
 
-impl WriteProxy {
-    pub fn sink() -> WriteProxy {
-        WriteProxy
-    }
-}
+// impl WriteProxy {
+//     pub fn sink() -> WriteProxy {
+//         WriteProxy
+//     }
+// }
 
-impl Write for WriteProxy {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        println!("Sink write: {:?}", std::str::from_utf8(buf));
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-impl AsyncWrite for WriteProxy {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        Poll::Ready(Ok(buf.len()))
-    }
+// impl Write for WriteProxy {
+//     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+//         println!("Sink write: {:?}", std::str::from_utf8(buf));
+//         Ok(buf.len())
+//     }
+//     fn flush(&mut self) -> std::io::Result<()> {
+//         Ok(())
+//     }
+// }
+// impl AsyncWrite for WriteProxy {
+//     fn poll_write(
+//         self: Pin<&mut Self>,
+//         _cx: &mut Context,
+//         buf: &[u8],
+//     ) -> Poll<Result<usize, std::io::Error>> {
+//         Poll::Ready(Ok(buf.len()))
+//     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(()))
-    }
+//     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+//         Poll::Ready(Ok(()))
+//     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
-        Poll::Ready(Ok(().into()))
-    }
-}
+//     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+//         Poll::Ready(Ok(().into()))
+//     }
+// }
 
 // Multi Writer
 #[derive(Debug)]
@@ -280,6 +298,7 @@ where
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
+println!("Poll write for buf (len: {}): {:?} {:?}", self.writers.len(), cx, std::str::from_utf8(buf));
         for mut writer in self.writers.iter_mut() {
             Pin::new(&mut writer).poll_write(cx, buf)?;
         }
