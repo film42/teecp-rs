@@ -1,3 +1,8 @@
+#[macro_use]
+extern crate failure;
+#[macro_use]
+extern crate futures;
+
 use core::pin::Pin;
 use core::task::Context;
 use core::task::Poll;
@@ -5,10 +10,13 @@ use futures::future::{select_all, try_select};
 use futures::lock::Mutex;
 use serde::{Deserialize, Serialize};
 //use std::io::Write;
+use futures::channel::mpsc;
 use std::net::SocketAddr; // Shutdown
 use std::sync::Arc;
+use tokio::net::tcp::split::WriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::prelude::*;
+use tokio::sync::watch;
 
 #[derive(Deserialize, Serialize, Debug)]
 struct Config {
@@ -31,6 +39,86 @@ static EXAMPLE_CONFIG: &str = r#"
 }
 "#;
 
+struct ByteForwarder {
+    senders: Vec<futures::channel::mpsc::UnboundedSender<Vec<u8>>>,
+}
+
+impl ByteForwarder {
+    fn new() -> ByteForwarder {
+        ByteForwarder { senders: vec![] }
+    }
+
+    fn push_sender(&mut self, sender: futures::channel::mpsc::UnboundedSender<Vec<u8>>) {
+        self.senders.push(sender)
+    }
+}
+
+impl AsyncWrite for ByteForwarder {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context,
+        mut buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        for sender in self.senders.iter() {
+            let mut copy_of_bytes: Vec<u8> = vec![];
+            // TODO: Check n-bytes copied to verify?
+            std::io::copy(&mut buf, &mut copy_of_bytes)?;
+            // TODO: Be smart here.
+            sender.unbounded_send(copy_of_bytes).unwrap();
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(().into()))
+    }
+}
+
+struct ChannelReader {
+    channel: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl AsyncRead for ChannelReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        mut buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.channel.try_next() {
+            Ok(Some(new_bytes)) => {
+                if buf.len() < new_bytes.len() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "Receiving buffer too small!",
+                    )));
+                }
+                match std::io::copy(&mut new_bytes.as_slice(), &mut buf) {
+                    Ok(n) => Poll::Ready(Ok(n as usize)),
+                    Err(e) => Poll::Ready(Err(e)),
+                }
+            }
+            Ok(None) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+        }
+    }
+}
+
+struct ClientRelay {
+    // // Idea here is that we can send this via the closer channel
+    // // and the client knows which connection broke.
+    // id: String,
+    // // This is our communication back to the client that we're
+    // // all done and need to be torn down.
+    // closer_channel: futures::channel::mpsc::UnboundedSender<String>,
+
+    // This should contain bytes to forward to the tee.
+    incoming_channel: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
 async fn connect_to_tees(
     tee_addrs: &Arc<Mutex<Vec<SocketAddr>>>,
 ) -> Result<Option<Vec<TcpStream>>, Box<dyn std::error::Error>> {
@@ -43,8 +131,78 @@ async fn connect_to_tees(
     Ok(Some(tees))
 }
 
+// async fn proxy_channel_receiver_to_async_writer<'a>(
+//     relay: &mut ClientRelay,
+//     mut writer: WriteHalf<'a>,
+// ) -> Result<(), failure::Error> {
+//     loop {
+//         match relay.incoming_channel.next().await {
+//             Some(mut buf) => writer.write_all(&mut buf).await?,
+//             None => bail!("channel closed"),
+//         };
+//     }
+// }
+
+async fn spawn_proxy_for_tee(
+    mut channel_reader: ChannelReader,
+    mut tee_conn: TcpStream,
+) -> Result<(), failure::Error> {
+    let (mut tee_reader, mut tee_writer) = tee_conn.split();
+    let mut sink = WriteProxy::sink();
+
+    match futures::future::try_join(
+        channel_reader.copy(&mut tee_writer),
+        tee_reader.copy(&mut sink),
+    )
+    .await
+    {
+        _ => Ok(()),
+        Err(e) => bail!(e),
+    }
+}
+
+// async fn spawn_proxy_for_tee(client_relay: ClientRelay, tee_conn: TcpStream) -> Result {
+//     let (mut tee_reader, mut tee_writer) = tee_conn.split();
+//     let mut sink = WriteProxy::sink();
+
+//     try_join!(
+//         proxy_channel_to_writer(client_relay.incoming, mut tee_writer),
+//         tee_reader.copy(&mut sink),
+//     )
+//     .await?;
+// }
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // //let (tx, mut rx) = watch::channel("sender hung up");
+    // let (tx, mut rx) = mpsc::unbounded();
+    // //let tx = Arc::new(Mutex::new(tx));
+
+    // use std::time::Duration;
+    // use tokio::timer::delay;
+
+    // for i in 1..10 {
+    //     let mut tx = tx.clone();
+    //     tokio::spawn(async move {
+    //         println!("Starting for {}", i);
+    //         delay(tokio::clock::now() + Duration::from_millis(100)).await;
+
+    //         //tx.broadcast("leet haxor");
+    //         tx.unbounded_send("closed");
+    //         tx.disconnect();
+    //         println!("Stopping for {}", i);
+    //     });
+    // }
+
+    // match rx.next().await {
+    //     Some(value) => println!("received stop = {:?} / shutting down", value),
+    //     None => {}
+    // };
+
+    // println!("Moving on...");
+
+    // -----------
+
     let c: Config = serde_json::from_str(EXAMPLE_CONFIG)?;
     let bind_addr = c.bind.to_string().parse::<SocketAddr>().unwrap();
     let proxy_addr = c.proxy.to_string().parse::<SocketAddr>().unwrap();
@@ -83,6 +241,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut copy_futures = vec![];
             // let mut multi_writer = MultiWriter::new();
             // let mut sinks = vec![];
+
+            let mut byte_forwarder = ByteForwarder::new();
+            for tee_conn in tee_conns.drain(..) {
+                let (tx, rx) = mpsc::unbounded();
+                byte_forwarder.push_sender(tx);
+
+                let relay = ChannelReader { channel: rx };
+                tokio::spawn(async move {
+                    spawn_proxy_for_tee(relay, tee_conn).await;
+                });
+            }
+
+            // LAST THING TO FIX: multi_writer.push(Box::new(byte_forwarder));
 
             // for tee_conn in tee_conns.iter_mut() {
             //     let (mut tee_reader, tee_writer) = tee_conn.split();
@@ -201,14 +372,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // use tokio::net::{TcpListener, TcpStream};
 // use tokio::prelude::*;
 
-// #[derive(Debug)]
-// struct WriteProxy;
+#[derive(Debug)]
+struct WriteProxy;
 
-// impl WriteProxy {
-//     pub fn sink() -> WriteProxy {
-//         WriteProxy
-//     }
-// }
+impl WriteProxy {
+    pub fn sink() -> WriteProxy {
+        WriteProxy
+    }
+}
 
 // impl Write for WriteProxy {
 //     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -219,23 +390,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //         Ok(())
 //     }
 // }
-// impl AsyncWrite for WriteProxy {
-//     fn poll_write(
-//         self: Pin<&mut Self>,
-//         _cx: &mut Context,
-//         buf: &[u8],
-//     ) -> Poll<Result<usize, std::io::Error>> {
-//         Poll::Ready(Ok(buf.len()))
-//     }
 
-//     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
-//         Poll::Ready(Ok(()))
-//     }
+impl AsyncWrite for WriteProxy {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Poll::Ready(Ok(buf.len()))
+    }
 
-//     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
-//         Poll::Ready(Ok(().into()))
-//     }
-// }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(().into()))
+    }
+}
 
 // Multi Writer
 #[derive(Debug)]
