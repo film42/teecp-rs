@@ -40,7 +40,7 @@ static EXAMPLE_CONFIG: &str = r#"
 "#;
 
 struct ByteForwarder {
-    senders: Vec<futures::channel::mpsc::UnboundedSender<Vec<u8>>>,
+    senders: Vec<futures::channel::mpsc::Sender<Vec<u8>>>,
 }
 
 impl ByteForwarder {
@@ -48,14 +48,14 @@ impl ByteForwarder {
         ByteForwarder { senders: vec![] }
     }
 
-    fn push_sender(&mut self, sender: futures::channel::mpsc::UnboundedSender<Vec<u8>>) {
+    fn push_sender(&mut self, sender: futures::channel::mpsc::Sender<Vec<u8>>) {
         self.senders.push(sender)
     }
 }
 
 impl AsyncWrite for ByteForwarder {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut Context,
         mut buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
@@ -63,14 +63,14 @@ impl AsyncWrite for ByteForwarder {
         // TODO: Check n-bytes copied to verify?
         std::io::copy(&mut buf, &mut copy_of_bytes)?;
 
-        for sender in self.senders.iter() {
+        for sender in self.senders.iter_mut() {
             eprintln!(
                 "ByteForwarder: Forwarding bytes: {:?}",
                 std::str::from_utf8(&copy_of_bytes)
             );
 
             // TODO: Be smart here.
-            match sender.unbounded_send(copy_of_bytes.clone()) {
+            match sender.try_send(copy_of_bytes.clone()) {
                 Ok(_) => {}
                 Err(e) => eprintln!("Error: {:?}", e),
             };
@@ -88,7 +88,7 @@ impl AsyncWrite for ByteForwarder {
 }
 
 struct ChannelReader {
-    channel: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>,
+    channel: futures::channel::mpsc::Receiver<Vec<u8>>,
 }
 
 impl AsyncRead for ChannelReader {
@@ -148,10 +148,10 @@ struct ClientRelay {
     // id: String,
     // // This is our communication back to the client that we're
     // // all done and need to be torn down.
-    // closer_channel: futures::channel::mpsc::UnboundedSender<String>,
+    // closer_channel: futures::channel::mpsc::Sender<String>,
 
     // This should contain bytes to forward to the tee.
-    incoming_channel: futures::channel::mpsc::UnboundedReceiver<Vec<u8>>,
+    incoming_channel: futures::channel::mpsc::Receiver<Vec<u8>>,
 }
 
 async fn connect_to_tees(
@@ -278,7 +278,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut byte_forwarder = ByteForwarder::new();
             for tee_conn in tee_conns.drain(..) {
-                let (tx, rx) = mpsc::unbounded();
+                // Setting this to 0 means each sender gets 1 buffer slot. Is this OK? Do we need to be unbounded here?
+                let (tx, rx) = mpsc::channel(0);
                 byte_forwarder.push_sender(tx);
 
                 let relay = ChannelReader { channel: rx };
