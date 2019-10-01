@@ -59,12 +59,21 @@ impl AsyncWrite for ByteForwarder {
         _cx: &mut Context,
         mut buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
+        let mut copy_of_bytes: Vec<u8> = vec![];
+        // TODO: Check n-bytes copied to verify?
+        std::io::copy(&mut buf, &mut copy_of_bytes)?;
+
         for sender in self.senders.iter() {
-            let mut copy_of_bytes: Vec<u8> = vec![];
-            // TODO: Check n-bytes copied to verify?
-            std::io::copy(&mut buf, &mut copy_of_bytes)?;
+            eprintln!(
+                "ByteForwarder: Forwarding bytes: {:?}",
+                std::str::from_utf8(&copy_of_bytes)
+            );
+
             // TODO: Be smart here.
-            sender.unbounded_send(copy_of_bytes).unwrap();
+            match sender.unbounded_send(copy_of_bytes.clone()) {
+                Ok(_) => {}
+                Err(e) => eprintln!("Error: {:?}", e),
+            };
         }
         Poll::Ready(Ok(buf.len()))
     }
@@ -88,22 +97,48 @@ impl AsyncRead for ChannelReader {
         cx: &mut Context,
         mut buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        match self.channel.try_next() {
-            Ok(Some(new_bytes)) => {
+        match Pin::new(&mut self.channel).poll_next(cx) {
+            Poll::Ready(Some(new_bytes)) => {
                 if buf.len() < new_bytes.len() {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         "Receiving buffer too small!",
                     )));
                 }
+                eprintln!(
+                    "ChannelReader: Data received: {:?}",
+                    std::str::from_utf8(&new_bytes)
+                );
+
                 match std::io::copy(&mut new_bytes.as_slice(), &mut buf) {
                     Ok(n) => Poll::Ready(Ok(n as usize)),
                     Err(e) => Poll::Ready(Err(e)),
                 }
             }
-            Ok(None) => Poll::Pending,
-            Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "channel closed",
+            ))),
+            Poll::Pending => Poll::Pending,
         }
+
+        // match futures::ready!(self.channel.next()) {
+        //     Some(new_bytes) => {
+        //         if buf.len() < new_bytes.len() {
+        //             return Poll::Ready(Err(std::io::Error::new(
+        //                 std::io::ErrorKind::Other,
+        //                 "Receiving buffer too small!",
+        //             )));
+        //         }
+        //         eprintln!("ChannelReader: Data received: {:?}", std::str::from_utf8(new_bytes.as_ref()));
+
+        //         match std::io::copy(&mut new_bytes.as_slice(), &mut buf) {
+        //             Ok(n) => Poll::Ready(Ok(n as usize)),
+        //             Err(e) => Poll::Ready(Err(e)),
+        //         }
+        //     },
+        //     None => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "channel closed")))
+        // }
     }
 }
 
@@ -147,14 +182,13 @@ async fn spawn_proxy_for_tee(
     mut channel_reader: ChannelReader,
     mut tee_conn: TcpStream,
 ) -> Result<(), failure::Error> {
-    let (mut tee_reader, mut tee_writer) = tee_conn.split();
+    let (mut tee_reader, tee_writer) = tee_conn.split();
     let mut sink = WriteProxy::sink();
+    let mut writer = MultiWriter::new();
+    writer.push(Box::new(WriteContainer::new_write_half(tee_writer)));
 
-    match futures::future::try_join(
-        channel_reader.copy(&mut tee_writer),
-        tee_reader.copy(&mut sink),
-    )
-    .await
+    match futures::future::try_join(channel_reader.copy(&mut writer), tee_reader.copy(&mut sink))
+        .await
     {
         _ => Ok(()),
         Err(e) => bail!(e),
@@ -233,10 +267,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let (mut clt_reader, clt_writer) = client.split();
             let mut clt_multi_writer = MultiWriter::new();
-            clt_multi_writer.push(Box::new(clt_writer));
+            clt_multi_writer.push(Box::new(WriteContainer::new_write_half(clt_writer)));
 
             let (mut srv_reader, srv_writer) = proxy_conn.split();
-            multi_writer.push(Box::new(srv_writer));
+            multi_writer.push(Box::new(WriteContainer::new_write_half(srv_writer)));
 
             let mut copy_futures = vec![];
             // let mut multi_writer = MultiWriter::new();
@@ -249,11 +283,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let relay = ChannelReader { channel: rx };
                 tokio::spawn(async move {
-                    spawn_proxy_for_tee(relay, tee_conn).await;
+                    eprintln!(
+                        "Tee finished: {:?}",
+                        spawn_proxy_for_tee(relay, tee_conn).await
+                    );
                 });
             }
 
-            // LAST THING TO FIX: multi_writer.push(Box::new(byte_forwarder));
+            // LAST THING TO FIX:
+            multi_writer.push(Box::new(WriteContainer::new_byte_forwarder(byte_forwarder)));
 
             // for tee_conn in tee_conns.iter_mut() {
             //     let (mut tee_reader, tee_writer) = tee_conn.split();
@@ -409,60 +447,95 @@ impl AsyncWrite for WriteProxy {
     }
 }
 
-// Multi Writer
-#[derive(Debug)]
-struct MultiWriter<T>
-where
-    T: Sized,
-{
-    writers: Vec<Box<T>>,
+struct WriteContainer<'a> {
+    write_half: Option<WriteHalf<'a>>,
+    byte_forwarder: Option<ByteForwarder>,
 }
 
-impl<T> MultiWriter<T>
-where
-    T: AsyncWrite,
-{
-    pub fn new() -> MultiWriter<T> {
+impl<'a> WriteContainer<'a> {
+    fn new_write_half(write_half: WriteHalf<'a>) -> WriteContainer<'a> {
+        WriteContainer {
+            write_half: Some(write_half),
+            byte_forwarder: None,
+        }
+    }
+
+    fn new_byte_forwarder(byte_forwarder: ByteForwarder) -> WriteContainer<'a> {
+        WriteContainer {
+            write_half: None,
+            byte_forwarder: Some(byte_forwarder),
+        }
+    }
+}
+
+impl AsyncWrite for WriteContainer<'_> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let mut me = Pin::new(&mut *self);
+        if let Some(writer) = &mut me.write_half {
+            return Pin::new(writer).poll_write(cx, buf);
+        }
+        if let Some(writer) = &mut me.byte_forwarder {
+            return Pin::new(writer).poll_write(cx, buf);
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), std::io::Error>> {
+        let mut me = Pin::new(&mut *self);
+        if let Some(writer) = &mut me.write_half {
+            return Pin::new(writer).poll_flush(cx);
+        }
+        if let Some(writer) = &mut me.byte_forwarder {
+            return Pin::new(writer).poll_flush(cx);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let mut me = Pin::new(&mut *self);
+        if let Some(writer) = &mut me.write_half {
+            return Pin::new(writer).poll_shutdown(cx);
+        }
+        if let Some(writer) = &mut me.byte_forwarder {
+            return Pin::new(writer).poll_shutdown(cx);
+        }
+        Poll::Ready(Ok(().into()))
+    }
+}
+
+// enum WriterContainer {
+//     WriteHalf(WriteHalf),
+//     ChannelWriter(ChannelWriter),
+// };
+
+// Multi Writer
+// #[derive(Debug)]
+struct MultiWriter<'a> {
+    writers: Vec<Box<WriteContainer<'a>>>,
+}
+
+impl<'a> MultiWriter<'a> {
+    pub fn new() -> MultiWriter<'a> {
         MultiWriter { writers: vec![] }
     }
 
-    pub fn sink() -> MultiWriter<T> {
+    pub fn sink() -> MultiWriter<'a> {
         MultiWriter { writers: vec![] }
     }
 
-    fn push(&mut self, writer: Box<T>) {
+    fn push(&mut self, writer: Box<WriteContainer<'a>>) {
         self.writers.push(writer);
     }
 }
 
-// impl<T> Write for MultiWriter<T>
-// where
-//     T: Write,
-// {
-//     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-//         for writer in self.writers.iter_mut() {
-//             let n = writer.write(buf)?;
-//             if n != buf.len() {
-//                 return Err(std::io::Error::new(
-//                     std::io::ErrorKind::Other,
-//                     "Short write!",
-//                 ));
-//             }
-//         }
-//         Ok(buf.len())
-//     }
-//     fn flush(&mut self) -> std::io::Result<()> {
-//         for writer in self.writers.iter_mut() {
-//             writer.flush()?;
-//         }
-//         Ok(())
-//     }
-// }
-
-impl<T> AsyncWrite for MultiWriter<T>
-where
-    T: AsyncWrite + Unpin,
-{
+impl AsyncWrite for MultiWriter<'_> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
@@ -498,6 +571,30 @@ where
         Poll::Ready(Ok(().into()))
     }
 }
+
+// impl<T> Write for MultiWriter<T>
+// where
+//     T: Write,
+// {
+//     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+//         for writer in self.writers.iter_mut() {
+//             let n = writer.write(buf)?;
+//             if n != buf.len() {
+//                 return Err(std::io::Error::new(
+//                     std::io::ErrorKind::Other,
+//                     "Short write!",
+//                 ));
+//             }
+//         }
+//         Ok(buf.len())
+//     }
+//     fn flush(&mut self) -> std::io::Result<()> {
+//         for writer in self.writers.iter_mut() {
+//             writer.flush()?;
+//         }
+//         Ok(())
+//     }
+// }
 
 // #[derive(Deserialize, Serialize, Debug)]
 // struct Config {
