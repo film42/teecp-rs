@@ -1,92 +1,11 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Result;
-
-use std::io::{self, Write};
-use std::net::SocketAddr; // Shutdown
-
-use futures::future::join_all;
-use tokio::io::copy; // shutdown
-use tokio::net::{TcpListener, TcpStream};
-use tokio::prelude::*;
-
-#[derive(Debug)]
-struct WriteProxy;
-
-impl WriteProxy {
-    pub fn sink() -> WriteProxy {
-        WriteProxy
-    }
-}
-
-impl Write for WriteProxy {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        println!("Sink write: {:?}", std::str::from_utf8(buf));
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-impl AsyncWrite for WriteProxy {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        Ok(().into())
-    }
-}
-
-// Multi Writer
-#[derive(Debug)]
-struct MultiWriter<T>
-where
-    T: Sized,
-{
-    writers: Vec<Box<T>>,
-}
-
-impl<T> MultiWriter<T>
-where
-    T: AsyncWrite,
-{
-    pub fn new() -> MultiWriter<T> {
-        MultiWriter { writers: vec![] }
-    }
-
-    fn push(&mut self, writer: Box<T>) {
-        self.writers.push(writer);
-    }
-}
-
-impl<T> Write for MultiWriter<T>
-where
-    T: AsyncWrite,
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        for writer in self.writers.iter_mut() {
-            let n = writer.write(buf)?;
-            if n != buf.len() {
-                return Err(io::Error::new(io::ErrorKind::Other, "Short write!"));
-            }
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        for writer in self.writers.iter_mut() {
-            writer.flush()?;
-        }
-        Ok(())
-    }
-}
-
-impl<T> AsyncWrite for MultiWriter<T>
-where
-    T: AsyncWrite,
-{
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        for writer in self.writers.iter_mut() {
-            writer.shutdown()?;
-        }
-        Ok(tokio::prelude::Async::Ready(()))
-    }
-}
+use std::io;
+use std::net::SocketAddr;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{
+    tcp::{ReadHalf, WriteHalf},
+    TcpListener, TcpStream,
+};
 
 #[derive(Deserialize, Serialize, Debug)]
 struct Config {
@@ -109,94 +28,121 @@ static EXAMPLE_CONFIG: &str = r#"
 }
 "#;
 
-fn proxy_copy<R1, W1, R2, W2>(
-    src_reader: R1,
-    dest_writer: W1,
-    dest_reader: R2,
-    src_writer: W2,
-) -> tokio::prelude::future::Select2<tokio::io::Copy<R1, W1>, tokio::io::Copy<R2, W2>>
+async fn copy_to_all_writers<R, W>(mut reader: R, mut writers: Vec<W>) -> io::Result<()>
 where
-    R1: AsyncRead,
-    R2: AsyncRead,
-    W1: AsyncWrite,
-    W2: AsyncWrite,
+    R: AsyncRead + std::marker::Unpin,
+    W: AsyncWrite + std::marker::Unpin,
 {
-    let src_to_dest = copy(dest_reader, src_writer);
-    let dest_to_src = copy(src_reader, dest_writer);
-    dest_to_src.select2(src_to_dest)
+    let mut buffer = [0; 8096];
+    loop {
+        let n = reader.read(&mut buffer[..]).await?;
+        if n == 0 {
+            // The reader has no more bytes to consume.
+            break;
+        }
+
+        // Do a full copy of the buffer to each writer.
+        // If the write fails, we should bail early.
+        for writer in writers.iter_mut() {
+            writer.write_all(&buffer[..n]).await?;
+        }
+    }
+
+    Ok(())
 }
 
-fn main() -> Result<()> {
-    let c: Config = serde_json::from_str(EXAMPLE_CONFIG)?;
-    let bind_addr = c.bind.to_string().parse::<SocketAddr>().unwrap();
-    let proxy_addr = c.proxy.to_string().parse::<SocketAddr>().unwrap();
-    println!("{:?}, {:?}", c, proxy_addr);
-
-    let tee_addrs: Vec<SocketAddr> = c
-        .tees
-        .iter()
-        .map(|s| s.to_string().parse::<SocketAddr>().unwrap())
-        .collect();
-    println!("Tees: {:?}", tee_addrs);
-
-    let listener = TcpListener::bind(&bind_addr).unwrap();
-
-    let done = listener
-        .incoming()
-        .map_err(|e| println!("Error accepting connection: {}", e))
-        .for_each(move |client| {
-            let proxy_conn = TcpStream::connect(&proxy_addr);
-            let mut connect_futures = vec![proxy_conn];
-
-            for tee_addr in tee_addrs.iter() {
-                connect_futures.push(TcpStream::connect(tee_addr))
-            }
-
-            let lifecycle = join_all(connect_futures).and_then(|mut conns| {
-                println!("Conns: {:?}", conns);
-
-                let (clt_reader, clt_writer) = client.split();
-                let srv_stream = conns.remove(0);
-                let (srv_reader, srv_writer) = srv_stream.split();
-
-                let mut multi_writer = MultiWriter::new();
-                multi_writer.push(Box::new(srv_writer));
-
-                let tee_reader_copy_futures: Vec<
-                    tokio::io::Copy<tokio::io::ReadHalf<TcpStream>, WriteProxy>,
-                > = conns
-                    .drain(..)
-                    .map(|tee_conn| {
-                        let (tee_reader, tee_writer) = tee_conn.split();
-                        multi_writer.push(Box::new(tee_writer));
-                        copy(tee_reader, WriteProxy::sink())
-                    })
-                    .collect();
-
-                proxy_copy(
-                    Box::new(clt_reader),
-                    Box::new(multi_writer),
-                    Box::new(srv_reader),
-                    Box::new(clt_writer),
-                )
-                .select2(tokio::prelude::future::select_all(tee_reader_copy_futures))
-                .then(|x| {
-                    x.map(|_| println!("It completed!"))
-                        .map_err(|err| eprintln!("An error occurred during the proxy: {:?}", err))
-                        .expect("never errors");
-
-                    // Do this because the type system doesn't want an io::Error here?
-                    future::ok(())
-                })
-            });
-
-            tokio::spawn(
-                lifecycle
-                    .map(|_| println!("The proxy is done"))
-                    .map_err(|err| eprintln!("Proxy err: {:?}", err)),
-            )
-        });
-
-    tokio::run(done);
+async fn sink<'a>(mut reader: ReadHalf<'a>) -> io::Result<()> {
+    let mut buffer = [0; 8096];
+    loop {
+        let n = reader.read(&mut buffer[..]).await?;
+        if n == 0 {
+            // The reader has no more bytes to consume.
+            break;
+        }
+    }
     Ok(())
+}
+
+async fn handle_client(
+    mut client: TcpStream,
+    upstream_proxy: SocketAddr,
+    upstream_tees: Vec<SocketAddr>,
+) -> io::Result<()> {
+    let mut proxy = TcpStream::connect(upstream_proxy.clone()).await?;
+
+    let mut tees: Vec<TcpStream> = futures::future::try_join_all(
+        upstream_tees
+            .iter()
+            .map(|tee_addr| TcpStream::connect(tee_addr)),
+    )
+    .await?;
+
+    let (tee_readers, mut tee_writers): (Vec<ReadHalf>, Vec<WriteHalf>) = tees.iter_mut().fold(
+        (vec![], vec![]),
+        |(mut readers, mut writers), tcp_stream| {
+            let (reader, writer) = tcp_stream.split();
+            readers.push(reader);
+            writers.push(writer);
+            (readers, writers)
+        },
+    );
+
+    let (mut client_reader, mut client_writer) = client.split();
+    let (mut proxy_reader, proxy_writer) = proxy.split();
+    tee_writers.push(proxy_writer);
+
+    // Write all proxy bytes back to the client. Drop all tee response bytes.
+    // Wait for any of the readers or writers to exit. Drop the entire combined
+    // future if it happens.
+    futures::future::select(
+        Box::pin(async { tokio::io::copy(&mut proxy_reader, &mut client_writer).await }),
+        futures::future::select(
+            Box::pin(async { copy_to_all_writers(&mut client_reader, tee_writers).await }),
+            Box::pin(async {
+                let sinks = tee_readers.into_iter().map(|reader| sink(reader));
+                futures::future::join_all(sinks).await
+            }),
+        ),
+    )
+    .await;
+
+    Ok(())
+}
+
+// 1. Listen for a connection.
+// 2. Connect to the upstream proxy.
+// 3. Connect to tee'd upstreams.
+// 4. Reply with all bytes from upstream proxy.
+// 5. Drop all bytes from upstream tees.
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let config: Config = serde_json::from_str(EXAMPLE_CONFIG)?;
+    println!("Starting server with config: {:?}", config);
+
+    let bind_addr = config.bind.parse::<SocketAddr>().unwrap();
+    let upstream_proxy = config.proxy.parse::<SocketAddr>().unwrap();
+    let upstream_tees: Vec<SocketAddr> = config
+        .tees
+        .into_iter()
+        .map(|addr| addr.parse::<SocketAddr>().unwrap())
+        .collect();
+
+    println!("Listening on: {:?}", bind_addr);
+    let mut listener = TcpListener::bind(bind_addr).await?;
+    loop {
+        let (client, _) = listener.accept().await?;
+        let client_info = format!("{:?}", client);
+        println!("Client connected: {:?}", client_info);
+        tokio::spawn({
+            let upstream_tees = upstream_tees.clone();
+
+            async move {
+                // All client bytes should be sent to proxy and tees.
+                if let Err(err) = handle_client(client, upstream_proxy, upstream_tees).await {
+                    println!("Error: {:?}", err);
+                }
+                println!("Client connection cleaned up: {:?}", client_info);
+            }
+        });
+    }
 }
