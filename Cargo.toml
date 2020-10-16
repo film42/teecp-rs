@@ -1,11 +1,13 @@
 [package]
-name = "teecp"
+name = "teecp-rs-2"
 version = "0.1.0"
 authors = ["Garrett Thornburg <film42@gmail.com>"]
 edition = "2018"
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 [dependencies]
+futures = "*"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = "0.1"
-futures = "*" 
+tokio = { version = "*", features = ["macros", "tcp", "rt-core", "stream", "io-util"] }
